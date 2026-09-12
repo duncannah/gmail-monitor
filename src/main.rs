@@ -242,13 +242,13 @@ fn process_new_messages(
 
         let matches = matching_webhooks(&config.webhooks, &senders);
         if !matches.is_empty() {
-            let body_messages = session.uid_fetch(uid.to_string(), "UID BODY.PEEK[TEXT]")?;
-            let body = body_messages
+            let body_messages = session.uid_fetch(uid.to_string(), "UID BODY.PEEK[]")?;
+            let raw_message = body_messages
                 .iter()
                 .next()
-                .and_then(|message| message.text())
-                .map(String::from_utf8_lossy)
-                .ok_or("Gmail did not return the requested message body")?;
+                .and_then(|message| message.body())
+                .ok_or("Gmail did not return the requested message")?;
+            let body = extract_plain_text(raw_message)?;
 
             for (webhook, sender) in matches {
                 post_webhook(
@@ -272,6 +272,30 @@ fn process_new_messages(
         save_state(&config.state_path, state)?;
     }
     Ok(())
+}
+
+fn extract_plain_text(raw_message: &[u8]) -> Result<String, mailparse::MailParseError> {
+    fn collect(
+        part: &mailparse::ParsedMail<'_>,
+        bodies: &mut Vec<String>,
+    ) -> Result<(), mailparse::MailParseError> {
+        if part.get_content_disposition().disposition == mailparse::DispositionType::Attachment {
+            return Ok(());
+        }
+        if part.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
+            bodies.push(part.get_body()?);
+            return Ok(());
+        }
+        for subpart in &part.subparts {
+            collect(subpart, bodies)?;
+        }
+        Ok(())
+    }
+
+    let parsed = mailparse::parse_mail(raw_message)?;
+    let mut bodies = Vec::new();
+    collect(&parsed, &mut bodies)?;
+    Ok(bodies.join("\n"))
 }
 
 fn matching_webhooks<'a>(
@@ -429,6 +453,38 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0.name, "two");
+    }
+
+    #[test]
+    fn extracts_plain_text_without_html_or_images() {
+        let message = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=outer\r\n\
+\r\n\
+--outer\r\n\
+Content-Type: multipart/alternative; boundary=inner\r\n\
+\r\n\
+--inner\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+Hello, plain text!=0A\r\n\
+--inner\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<strong>HTML</strong>\r\n\
+--inner--\r\n\
+--outer\r\n\
+Content-Type: image/png\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=image.png\r\n\
+\r\n\
+iVBORw0KGgo=\r\n\
+--outer--\r\n";
+
+        let body = extract_plain_text(message).unwrap();
+        assert_eq!(body, "Hello, plain text!\n");
+        assert!(!body.contains("HTML"));
+        assert!(!body.contains("iVBOR"));
     }
 
     #[test]

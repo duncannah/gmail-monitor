@@ -72,9 +72,9 @@ Webhook body:
 }
 ```
 
-The `body` field contains Gmail's IMAP `BODY[TEXT]` value. For MIME messages, it can
-contain MIME boundaries and transfer-encoded content. The daemon does not download
-the body at all when no route matches.
+The `body` field contains decoded `text/plain` MIME parts only. HTML, images, and
+attachments are excluded. If a message has no plain-text part, `body` is an empty
+string. The daemon does not download the message at all when no route matches.
 
 The endpoint must return a 2xx status. Otherwise the message remains
 uncheckpointed and is retried after reconnecting. Each route gets a stable
