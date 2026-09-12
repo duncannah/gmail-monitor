@@ -54,18 +54,25 @@ webhook performs non-idempotent work.
 
 ## Run with Docker
 
+Pull the published ARM64 image from GitHub Container Registry:
+
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 -t gmail-monitor .
+docker pull ghcr.io/duncannah/gmail-monitor:latest
 
 docker run --rm \
   --env-file .env \
   -v gmail-monitor-data:/data \
-  gmail-monitor
+  ghcr.io/duncannah/gmail-monitor:latest
 ```
 
-BuildKit builds on the selected AMD64 or ARM64 base image. The final image contains
-only Debian's TLS runtime, CA certificates, and the stripped daemon binary. It runs
-as an unprivileged user.
+The image targets ARM64. It contains only Debian's TLS runtime, CA certificates,
+and the stripped daemon binary, and runs as an unprivileged user.
+
+To build it locally instead:
+
+```sh
+docker build -t gmail-monitor .
+```
 
 ## Develop with Nix
 
