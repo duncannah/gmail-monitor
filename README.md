@@ -101,13 +101,3 @@ To build it locally instead:
 ```sh
 docker build -t gmail-monitor .
 ```
-
-## Develop with Nix
-
-```sh
-nix develop
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
-
-Build the package directly with `nix build`.
