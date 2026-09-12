@@ -1,0 +1,18 @@
+state_path = "/data/state.json"
+
+[gmail]
+email = "me@gmail.com"
+client_id = "your-client-id.apps.googleusercontent.com"
+client_secret = "your-client-secret"
+refresh_token = "your-refresh-token"
+
+[[webhooks]]
+name = "alerts"
+url = "https://example.com/hooks/alerts"
+senders = ["alerts@example.com", "status@example.net"]
+bearer_token = "optional-token"
+
+[[webhooks]]
+name = "billing"
+url = "https://example.com/hooks/billing"
+senders = ["billing@example.com"]

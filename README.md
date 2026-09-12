@@ -1,9 +1,9 @@
 # gmail-monitor
 
 A small, single-process Rust daemon that waits for Gmail mailbox changes with IMAP
-IDLE. It fetches only each new message's IMAP envelope, matches its sender, and
-POSTs a JSON webhook. There is no polling loop, message-body download, database,
-or async runtime.
+IDLE. It fetches each new message's IMAP envelope, checks independently configured
+webhook routes, and only downloads the message body when a route matches. There is
+no polling loop, database, or async runtime.
 
 On its first run, the daemon checkpoints the current end of the inbox and only
 handles mail that arrives afterward. It persists `UIDVALIDITY` and the last handled
@@ -29,28 +29,56 @@ connects or reconnects. It is never written to disk.
 
 ## Configuration
 
-All configuration uses environment variables:
+Copy [`config.example.toml`](config.example.toml) and define one or more webhook
+routes:
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `GMAIL_EMAIL` | yes | Gmail address used for IMAP authentication |
-| `GMAIL_CLIENT_ID` | yes | Google OAuth client ID |
-| `GMAIL_CLIENT_SECRET` | yes | Google OAuth client secret |
-| `GMAIL_REFRESH_TOKEN` | yes | OAuth offline refresh token |
-| `MATCH_SENDERS` | yes | Comma-separated sender addresses; matching is case-insensitive |
-| `WEBHOOK_URL` | yes | HTTPS endpoint to POST |
-| `WEBHOOK_BEARER_TOKEN` | no | Adds an `Authorization: Bearer ...` header |
-| `STATE_PATH` | no | Checkpoint path; defaults to `/data/state.json` |
+```toml
+state_path = "/data/state.json"
+
+[gmail]
+email = "me@gmail.com"
+client_id = "your-client-id.apps.googleusercontent.com"
+client_secret = "your-client-secret"
+refresh_token = "your-refresh-token"
+
+[[webhooks]]
+name = "alerts"
+url = "https://example.com/hooks/alerts"
+senders = ["alerts@example.com", "status@example.net"]
+bearer_token = "optional-token"
+
+[[webhooks]]
+name = "billing"
+url = "https://example.com/hooks/billing"
+senders = ["billing@example.com"]
+```
+
+Webhook names must be unique. Sender matching is case-insensitive. The
+`bearer_token` and top-level `state_path` fields are optional; the state path
+defaults to `/data/state.json`.
+
+Set `CONFIG_PATH` to change the configuration path. It defaults to
+`/config/config.toml`, which works well with a read-only Docker bind mount.
 
 Webhook body:
 
 ```json
-{"account":"me@gmail.com","sender":"alerts@example.com","uid":123,"uid_validity":456}
+{
+  "account": "me@gmail.com",
+  "sender": "alerts@example.com",
+  "body": "This is the message body.\r\n",
+  "uid": 123,
+  "uid_validity": 456
+}
 ```
 
-The endpoint must return a 2xx status. Otherwise the message remains uncheckpointed
-and is retried after reconnecting. Use the `Idempotency-Key` request header when the
-webhook performs non-idempotent work.
+The `body` field contains Gmail's IMAP `BODY[TEXT]` value. For MIME messages, it can
+contain MIME boundaries and transfer-encoded content. The daemon does not download
+the body at all when no route matches.
+
+The endpoint must return a 2xx status. Otherwise the message remains
+uncheckpointed and is retried after reconnecting. Each route gets a stable
+`Idempotency-Key` header in the form `gmail:<route>:<uid_validity>:<uid>`.
 
 ## Run with Docker
 
@@ -60,7 +88,7 @@ Pull the published ARM64 image from GitHub Container Registry:
 docker pull ghcr.io/duncannah/gmail-monitor:latest
 
 docker run --rm \
-  --env-file .env \
+  -v ./config.toml:/config/config.toml:ro \
   -v gmail-monitor-data:/data \
   ghcr.io/duncannah/gmail-monitor:latest
 ```

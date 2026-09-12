@@ -18,41 +18,60 @@ use std::time::Duration;
 type AnyError = Box<dyn Error + Send + Sync>;
 type Session = imap::Session<TlsStream<TcpStream>>;
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 struct Config {
+    gmail: GmailConfig,
+    #[serde(default = "default_state_path")]
+    state_path: PathBuf,
+    webhooks: Vec<WebhookConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailConfig {
     email: String,
     client_id: String,
     client_secret: String,
     refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookConfig {
+    name: String,
+    url: String,
     senders: HashSet<String>,
-    webhook_url: String,
-    webhook_bearer_token: Option<String>,
-    state_path: PathBuf,
+    bearer_token: Option<String>,
 }
 
 impl Config {
-    fn from_env() -> Result<Self, AnyError> {
-        let senders = required("MATCH_SENDERS")?
-            .split(',')
-            .map(normalize_email)
-            .filter(|value| !value.is_empty())
-            .collect::<HashSet<_>>();
-        if senders.is_empty() {
-            return Err("MATCH_SENDERS must contain at least one email address".into());
+    fn load(path: &Path) -> Result<Self, AnyError> {
+        let contents = fs::read_to_string(path)?;
+        let mut config: Self = toml::from_str(&contents)?;
+        if config.webhooks.is_empty() {
+            return Err("configuration must contain at least one [[webhooks]] entry".into());
         }
 
-        Ok(Self {
-            email: required("GMAIL_EMAIL")?,
-            client_id: required("GMAIL_CLIENT_ID")?,
-            client_secret: required("GMAIL_CLIENT_SECRET")?,
-            refresh_token: required("GMAIL_REFRESH_TOKEN")?,
-            senders,
-            webhook_url: required("WEBHOOK_URL")?,
-            webhook_bearer_token: env::var("WEBHOOK_BEARER_TOKEN").ok(),
-            state_path: env::var_os("STATE_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/data/state.json")),
-        })
+        let mut names = HashSet::new();
+        for webhook in &mut config.webhooks {
+            webhook.name = webhook.name.trim().to_owned();
+            webhook.senders = webhook
+                .senders
+                .iter()
+                .map(|sender| normalize_email(sender))
+                .filter(|sender| !sender.is_empty())
+                .collect();
+            if webhook.name.is_empty() || webhook.url.trim().is_empty() {
+                return Err("each webhook requires a non-empty name and url".into());
+            }
+            if webhook.senders.is_empty() {
+                return Err(
+                    format!("webhook {} requires at least one sender", webhook.name).into(),
+                );
+            }
+            if !names.insert(webhook.name.clone()) {
+                return Err(format!("duplicate webhook name: {}", webhook.name).into());
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -81,11 +100,19 @@ impl imap::Authenticator for Xoauth2<'_> {
 }
 
 fn main() -> Result<(), AnyError> {
-    let config = Config::from_env()?;
+    let config_path = env::var_os("CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/config/config.toml"));
+    let config = Config::load(&config_path)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let http: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
         .timeout_global(Some(Duration::from_secs(30)))
         .input_buffer_size(8 * 1024)
         .output_buffer_size(8 * 1024)
@@ -93,7 +120,11 @@ fn main() -> Result<(), AnyError> {
         .build()
         .into();
 
-    log("info", "starting", json!({"senders": config.senders.len()}));
+    log(
+        "info",
+        "starting",
+        json!({"config": config_path, "webhooks": config.webhooks.len()}),
+    );
     run(&config, &http, &shutdown);
     log("info", "stopped", json!({}));
     Ok(())
@@ -118,14 +149,14 @@ fn run(config: &Config, http: &ureq::Agent, shutdown: &AtomicBool) {
 }
 
 fn monitor(config: &Config, http: &ureq::Agent, shutdown: &AtomicBool) -> Result<(), AnyError> {
-    let token = refresh_access_token(config, http)?;
+    let token = refresh_access_token(&config.gmail, http)?;
     let tls = TlsConnector::builder().build()?;
     let client = imap::connect(("imap.gmail.com", 993), "imap.gmail.com", &tls)?;
     let mut session = client
         .authenticate(
             "XOAUTH2",
             &Xoauth2 {
-                email: &config.email,
+                email: &config.gmail.email,
                 token: &token,
             },
         )
@@ -151,7 +182,11 @@ fn monitor(config: &Config, http: &ureq::Agent, shutdown: &AtomicBool) -> Result
     }
 
     process_new_messages(&mut session, config, http, &mut state)?;
-    log("info", "imap_connected", json!({"account": config.email}));
+    log(
+        "info",
+        "imap_connected",
+        json!({"account": config.gmail.email}),
+    );
 
     while !shutdown.load(Ordering::Relaxed) {
         let outcome = {
@@ -183,33 +218,54 @@ fn process_new_messages(
 
     for uid in uids {
         let messages = session.uid_fetch(uid.to_string(), "UID ENVELOPE")?;
-        let Some(message) = messages.iter().next() else {
-            continue;
-        };
-        let sender = message
-            .envelope()
+        let senders = messages
+            .iter()
+            .next()
+            .and_then(|message| message.envelope())
             .and_then(|envelope| envelope.from.as_ref())
-            .and_then(|addresses| {
-                addresses.iter().find_map(|address| {
-                    let (Some(mailbox), Some(host)) = (&address.mailbox, &address.host) else {
-                        return None;
-                    };
-                    let value = normalize_email(&format!(
-                        "{}@{}",
-                        String::from_utf8_lossy(mailbox),
-                        String::from_utf8_lossy(host)
-                    ));
-                    config.senders.contains(&value).then_some(value)
-                })
-            });
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .filter_map(|address| {
+                        let (Some(mailbox), Some(host)) = (&address.mailbox, &address.host) else {
+                            return None;
+                        };
+                        Some(normalize_email(&format!(
+                            "{}@{}",
+                            String::from_utf8_lossy(mailbox),
+                            String::from_utf8_lossy(host)
+                        )))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-        if let Some(sender) = sender {
-            post_webhook(config, http, uid, &sender, state.uid_validity)?;
-            log(
-                "info",
-                "webhook_sent",
-                json!({"uid": uid, "sender": sender}),
-            );
+        let matches = matching_webhooks(&config.webhooks, &senders);
+        if !matches.is_empty() {
+            let body_messages = session.uid_fetch(uid.to_string(), "UID BODY.PEEK[TEXT]")?;
+            let body = body_messages
+                .iter()
+                .next()
+                .and_then(|message| message.text())
+                .map(String::from_utf8_lossy)
+                .ok_or("Gmail did not return the requested message body")?;
+
+            for (webhook, sender) in matches {
+                post_webhook(
+                    config,
+                    webhook,
+                    http,
+                    uid,
+                    sender,
+                    &body,
+                    state.uid_validity,
+                )?;
+                log(
+                    "info",
+                    "webhook_sent",
+                    json!({"webhook": webhook.name, "uid": uid, "sender": sender}),
+                );
+            }
         }
 
         state.last_uid = uid;
@@ -218,13 +274,28 @@ fn process_new_messages(
     Ok(())
 }
 
-fn refresh_access_token(config: &Config, http: &ureq::Agent) -> Result<String, AnyError> {
+fn matching_webhooks<'a>(
+    webhooks: &'a [WebhookConfig],
+    senders: &'a [String],
+) -> Vec<(&'a WebhookConfig, &'a str)> {
+    webhooks
+        .iter()
+        .filter_map(|webhook| {
+            senders
+                .iter()
+                .find(|sender| webhook.senders.contains(*sender))
+                .map(|sender| (webhook, sender.as_str()))
+        })
+        .collect()
+}
+
+fn refresh_access_token(gmail: &GmailConfig, http: &ureq::Agent) -> Result<String, AnyError> {
     let mut response = http
         .post("https://oauth2.googleapis.com/token")
         .send_form([
-            ("client_id", config.client_id.as_str()),
-            ("client_secret", config.client_secret.as_str()),
-            ("refresh_token", config.refresh_token.as_str()),
+            ("client_id", gmail.client_id.as_str()),
+            ("client_secret", gmail.client_secret.as_str()),
+            ("refresh_token", gmail.refresh_token.as_str()),
             ("grant_type", "refresh_token"),
         ])?;
     let body = response.body_mut().read_to_string()?;
@@ -234,23 +305,26 @@ fn refresh_access_token(config: &Config, http: &ureq::Agent) -> Result<String, A
 
 fn post_webhook(
     config: &Config,
+    webhook: &WebhookConfig,
     http: &ureq::Agent,
     uid: Uid,
     sender: &str,
+    body: &str,
     uid_validity: u32,
 ) -> Result<(), AnyError> {
-    let idempotency_key = format!("gmail:{uid_validity}:{uid}");
+    let idempotency_key = format!("gmail:{}:{uid_validity}:{uid}", webhook.name);
     let payload = serde_json::to_vec(&json!({
-        "account": config.email,
+        "account": config.gmail.email,
         "sender": sender,
+        "body": body,
         "uid": uid,
         "uid_validity": uid_validity,
     }))?;
     let mut request = http
-        .post(&config.webhook_url)
+        .post(&webhook.url)
         .header("content-type", "application/json")
         .header("idempotency-key", &idempotency_key);
-    if let Some(token) = &config.webhook_bearer_token {
+    if let Some(token) = &webhook.bearer_token {
         request = request.header("authorization", &format!("Bearer {token}"));
     }
     request.send(payload)?;
@@ -275,8 +349,8 @@ fn save_state(path: &Path, state: &State) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn required(name: &str) -> Result<String, AnyError> {
-    env::var(name).map_err(|_| format!("missing required environment variable {name}").into())
+fn default_state_path() -> PathBuf {
+    PathBuf::from("/data/state.json")
 }
 
 fn normalize_email(value: &str) -> String {
@@ -308,8 +382,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_sender_addresses() {
-        assert_eq!(normalize_email("  Alert@Example.COM "), "alert@example.com");
+    fn parses_multiple_webhooks() {
+        let config: Config = toml::from_str(
+            r#"
+                [gmail]
+                email = "me@gmail.com"
+                client_id = "client"
+                client_secret = "secret"
+                refresh_token = "refresh"
+
+                [[webhooks]]
+                name = "alerts"
+                url = "https://example.com/alerts"
+                senders = ["alert@example.com"]
+
+                [[webhooks]]
+                name = "billing"
+                url = "https://example.com/billing"
+                senders = ["billing@example.com"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.webhooks.len(), 2);
+        assert_eq!(config.state_path, PathBuf::from("/data/state.json"));
+    }
+
+    #[test]
+    fn matches_each_route_independently() {
+        let webhooks = vec![
+            WebhookConfig {
+                name: "one".into(),
+                url: "https://example.com/one".into(),
+                senders: HashSet::from(["a@example.com".into()]),
+                bearer_token: None,
+            },
+            WebhookConfig {
+                name: "two".into(),
+                url: "https://example.com/two".into(),
+                senders: HashSet::from(["b@example.com".into()]),
+                bearer_token: None,
+            },
+        ];
+        let senders = vec!["b@example.com".into()];
+        let matches = matching_webhooks(&webhooks, &senders);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0.name, "two");
     }
 
     #[test]
