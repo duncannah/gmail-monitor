@@ -1,0 +1,326 @@
+use imap::types::Uid;
+use native_tls::{TlsConnector, TlsStream};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use std::collections::HashSet;
+use std::env;
+use std::error::Error;
+use std::fs;
+use std::io;
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+type AnyError = Box<dyn Error + Send + Sync>;
+type Session = imap::Session<TlsStream<TcpStream>>;
+
+#[derive(Debug)]
+struct Config {
+    email: String,
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+    senders: HashSet<String>,
+    webhook_url: String,
+    webhook_bearer_token: Option<String>,
+    state_path: PathBuf,
+}
+
+impl Config {
+    fn from_env() -> Result<Self, AnyError> {
+        let senders = required("MATCH_SENDERS")?
+            .split(',')
+            .map(normalize_email)
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>();
+        if senders.is_empty() {
+            return Err("MATCH_SENDERS must contain at least one email address".into());
+        }
+
+        Ok(Self {
+            email: required("GMAIL_EMAIL")?,
+            client_id: required("GMAIL_CLIENT_ID")?,
+            client_secret: required("GMAIL_CLIENT_SECRET")?,
+            refresh_token: required("GMAIL_REFRESH_TOKEN")?,
+            senders,
+            webhook_url: required("WEBHOOK_URL")?,
+            webhook_bearer_token: env::var("WEBHOOK_BEARER_TOKEN").ok(),
+            state_path: env::var_os("STATE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data/state.json")),
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct State {
+    uid_validity: u32,
+    last_uid: Uid,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+struct Xoauth2<'a> {
+    email: &'a str,
+    token: &'a str,
+}
+
+impl imap::Authenticator for Xoauth2<'_> {
+    type Response = String;
+
+    fn process(&self, _: &[u8]) -> Self::Response {
+        format!("user={}\x01auth=Bearer {}\x01\x01", self.email, self.token)
+    }
+}
+
+fn main() -> Result<(), AnyError> {
+    let config = Config::from_env()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
+    let http: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .input_buffer_size(8 * 1024)
+        .output_buffer_size(8 * 1024)
+        .max_idle_connections(2)
+        .build()
+        .into();
+
+    log("info", "starting", json!({"senders": config.senders.len()}));
+    run(&config, &http, &shutdown);
+    log("info", "stopped", json!({}));
+    Ok(())
+}
+
+fn run(config: &Config, http: &ureq::Agent, shutdown: &AtomicBool) {
+    let mut delay = 1;
+    while !shutdown.load(Ordering::Relaxed) {
+        match monitor(config, http, shutdown) {
+            Ok(()) => break,
+            Err(error) => {
+                log(
+                    "error",
+                    "connection_lost",
+                    json!({"error": error.to_string(), "retry_seconds": delay}),
+                );
+                interruptible_sleep(Duration::from_secs(delay), shutdown);
+                delay = (delay * 2).min(60);
+            }
+        }
+    }
+}
+
+fn monitor(config: &Config, http: &ureq::Agent, shutdown: &AtomicBool) -> Result<(), AnyError> {
+    let token = refresh_access_token(config, http)?;
+    let tls = TlsConnector::builder().build()?;
+    let client = imap::connect(("imap.gmail.com", 993), "imap.gmail.com", &tls)?;
+    let mut session = client
+        .authenticate(
+            "XOAUTH2",
+            &Xoauth2 {
+                email: &config.email,
+                token: &token,
+            },
+        )
+        .map_err(|(error, _)| error)?;
+
+    let mailbox = session.select("INBOX")?;
+    let uid_validity = mailbox
+        .uid_validity
+        .ok_or("Gmail did not return UIDVALIDITY")?;
+    let mut state = load_state(&config.state_path)?;
+
+    if state.uid_validity != uid_validity {
+        state = State {
+            uid_validity,
+            last_uid: mailbox.uid_next.unwrap_or(1).saturating_sub(1),
+        };
+        save_state(&config.state_path, &state)?;
+        log(
+            "info",
+            "checkpoint_initialized",
+            json!({"uid_validity": uid_validity, "last_uid": state.last_uid}),
+        );
+    }
+
+    process_new_messages(&mut session, config, http, &mut state)?;
+    log("info", "imap_connected", json!({"account": config.email}));
+
+    while !shutdown.load(Ordering::Relaxed) {
+        let outcome = {
+            let idle = session.idle()?;
+            idle.wait_with_timeout(Duration::from_secs(30))?
+        };
+        match outcome {
+            imap::extensions::idle::WaitOutcome::MailboxChanged => {
+                process_new_messages(&mut session, config, http, &mut state)?;
+            }
+            imap::extensions::idle::WaitOutcome::TimedOut => {}
+        }
+    }
+
+    let _ = session.logout();
+    Ok(())
+}
+
+fn process_new_messages(
+    session: &mut Session,
+    config: &Config,
+    http: &ureq::Agent,
+    state: &mut State,
+) -> Result<(), AnyError> {
+    let query = format!("UID {}:*", state.last_uid.saturating_add(1));
+    let mut uids = session.uid_search(query)?.into_iter().collect::<Vec<_>>();
+    uids.retain(|uid| *uid > state.last_uid);
+    uids.sort_unstable();
+
+    for uid in uids {
+        let messages = session.uid_fetch(uid.to_string(), "UID ENVELOPE")?;
+        let Some(message) = messages.iter().next() else {
+            continue;
+        };
+        let sender = message
+            .envelope()
+            .and_then(|envelope| envelope.from.as_ref())
+            .and_then(|addresses| {
+                addresses.iter().find_map(|address| {
+                    let (Some(mailbox), Some(host)) = (&address.mailbox, &address.host) else {
+                        return None;
+                    };
+                    let value = normalize_email(&format!(
+                        "{}@{}",
+                        String::from_utf8_lossy(mailbox),
+                        String::from_utf8_lossy(host)
+                    ));
+                    config.senders.contains(&value).then_some(value)
+                })
+            });
+
+        if let Some(sender) = sender {
+            post_webhook(config, http, uid, &sender, state.uid_validity)?;
+            log(
+                "info",
+                "webhook_sent",
+                json!({"uid": uid, "sender": sender}),
+            );
+        }
+
+        state.last_uid = uid;
+        save_state(&config.state_path, state)?;
+    }
+    Ok(())
+}
+
+fn refresh_access_token(config: &Config, http: &ureq::Agent) -> Result<String, AnyError> {
+    let mut response = http
+        .post("https://oauth2.googleapis.com/token")
+        .send_form([
+            ("client_id", config.client_id.as_str()),
+            ("client_secret", config.client_secret.as_str()),
+            ("refresh_token", config.refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ])?;
+    let body = response.body_mut().read_to_string()?;
+    let token: TokenResponse = serde_json::from_str(&body)?;
+    Ok(token.access_token)
+}
+
+fn post_webhook(
+    config: &Config,
+    http: &ureq::Agent,
+    uid: Uid,
+    sender: &str,
+    uid_validity: u32,
+) -> Result<(), AnyError> {
+    let idempotency_key = format!("gmail:{uid_validity}:{uid}");
+    let payload = serde_json::to_vec(&json!({
+        "account": config.email,
+        "sender": sender,
+        "uid": uid,
+        "uid_validity": uid_validity,
+    }))?;
+    let mut request = http
+        .post(&config.webhook_url)
+        .header("content-type", "application/json")
+        .header("idempotency-key", &idempotency_key);
+    if let Some(token) = &config.webhook_bearer_token {
+        request = request.header("authorization", &format!("Bearer {token}"));
+    }
+    request.send(payload)?;
+    Ok(())
+}
+
+fn load_state(path: &Path) -> Result<State, AnyError> {
+    match fs::read(path) {
+        Ok(contents) => Ok(serde_json::from_slice(&contents)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(State::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_state(path: &Path, state: &State) -> Result<(), AnyError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec(state)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn required(name: &str) -> Result<String, AnyError> {
+    env::var(name).map_err(|_| format!("missing required environment variable {name}").into())
+}
+
+fn normalize_email(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn interruptible_sleep(duration: Duration, shutdown: &AtomicBool) {
+    for _ in 0..duration.as_secs() {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn log(level: &str, event: &str, fields: serde_json::Value) {
+    eprintln!(
+        "{}",
+        json!({
+            "level": level,
+            "event": event,
+            "fields": fields,
+        })
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_sender_addresses() {
+        assert_eq!(normalize_email("  Alert@Example.COM "), "alert@example.com");
+    }
+
+    #[test]
+    fn state_round_trips() {
+        let state = State {
+            uid_validity: 42,
+            last_uid: 123,
+        };
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: State = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.uid_validity, 42);
+        assert_eq!(decoded.last_uid, 123);
+    }
+}
